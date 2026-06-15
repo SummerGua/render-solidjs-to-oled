@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SolidJS → SSD1306 OLED 自定义渲染器 技术讲解</title>
+<style>
+  :root {
+    --bg: #1a1b26; --fg: #c0caf5; --accent: #7dcfff; --code: #1e2030;
+    --green: #9ece6a; --orange: #ff9e64; --red: #f7768e; --purple: #bb9af7;
+    --border: #3b4261; --card: #24283b;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--fg); font:16px/1.8 'Segoe UI',system-ui,sans-serif; }
+  .container { max-width:900px; margin:0 auto; padding:40px 24px; }
+
+  h1 { font-size:2.2em; text-align:center; margin-bottom:.3em; background:linear-gradient(135deg,var(--accent),var(--purple)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+  h2 { font-size:1.5em; color:var(--accent); margin:2em 0 .6em; padding-bottom:.3em; border-bottom:2px solid var(--border); }
+  h3 { color:var(--green); margin:1.5em 0 .4em; }
+
+  p { margin:.6em 0; }
+  code { background:var(--code); padding:2px 8px; border-radius:4px; font-family:'JetBrains Mono','Fira Code',monospace; font-size:.9em; color:var(--orange); }
+  pre { background:var(--code); border:1px solid var(--border); border-radius:8px; padding:16px 20px; overflow-x:auto; margin:1em 0; }
+  pre code { background:none; padding:0; color:var(--fg); }
+
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:20px 24px; margin:1.2em 0; }
+
+  /* architecture diagram */
+  .arch { display:flex; flex-direction:column; gap:0; margin:2em 0; font-family:monospace; }
+  .arch-row { display:flex; justify-content:center; align-items:center; gap:12px; }
+  .arch-box { border-radius:8px; padding:10px 18px; text-align:center; font-size:.85em; white-space:nowrap; }
+  .arch-arrow { color:var(--accent); font-size:1.4em; }
+  .layer-user { background:#1e3a5f; border:1px solid var(--accent); }
+  .layer-renderer { background:#1e4a3a; border:1px solid var(--green); }
+  .layer-ffi { background:#4a3a1e; border:1px solid var(--orange); }
+  .layer-c { background:#3a1e4a; border:1px solid var(--purple); }
+  .layer-hw { background:#4a1e2e; border:1px solid var(--red); }
+
+  /* data flow diagram */
+  .flow { position:relative; margin:2em 0; padding:20px; }
+  .flow-step { display:flex; align-items:flex-start; gap:16px; margin:12px 0; }
+  .flow-num { background:var(--accent); color:var(--bg); border-radius:50%; width:28px; height:28px; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:.85em; flex-shrink:0; }
+  .flow-content { flex:1; }
+  .flow-line { border-left:2px dashed var(--border); margin-left:13px; padding-left:24px; }
+
+  table { width:100%; border-collapse:collapse; margin:1em 0; }
+  th { background:var(--code); color:var(--accent); padding:8px 12px; text-align:left; }
+  td { padding:8px 12px; border-bottom:1px solid var(--border); }
+
+  .highlight { background:linear-gradient(135deg,rgba(125,207,255,.15),rgba(187,154,247,.15)); border-radius:8px; padding:4px 12px; }
+  .tip { background:rgba(158,206,106,.1); border-left:3px solid var(--green); padding:12px 16px; margin:1em 0; border-radius:0 8px 8px 0; }
+  .warn { background:rgba(255,158,100,.1); border-left:3px solid var(--orange); padding:12px 16px; margin:1em 0; border-radius:0 8px 8px 0; }
+
+  @media (max-width:600px) {
+    .arch-box { font-size:.7em; padding:6px 10px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>🔧 SolidJS → SSD1306 OLED 自定义渲染器</h1>
+<p style="text-align:center;color:var(--accent)">从 C 语言驱动到 JSX 响应式 UI — 技术全链路讲解</p>
+
+<!-- ============================================================ -->
+<h2>一、这个项目做了什么</h2>
+<p>用 <strong style="color:var(--accent)">SolidJS 写 JSX 组件</strong>，实时渲染到一块 <strong style="color:var(--green)">128×64 单色 OLED 屏幕</strong>（SSD1306 芯片，I2C 通信），跑在树莓派上。</p>
+
+<pre><code>&lt;!-- 和写 React 一模一样！ --&gt;
+&lt;Screen&gt;
+  &lt;Text x={0} y={0}&gt;Hello OLED!&lt;/Text&gt;
+  &lt;Text x={0} y={2}&gt;Count: {count()}&lt;/Text&gt;
+  &lt;Pixel x={42} y={32} /&gt;
+&lt;/Screen&gt;</code></pre>
+
+<p>信号变化 → OLED 自动刷新。和你在浏览器里写 Vue/React 体验一致。</p>
+
+<div class="tip">
+  <strong>🤔 核心问题：</strong>React/Vue/SolidJS 默认渲染目标是 <strong>浏览器 DOM</strong>。<br>
+  怎么让它们渲染到一块 128×64 的 I2C 屏幕？
+</div>
+
+<!-- ============================================================ -->
+<h2>二、技术架构全景图</h2>
+
+<div class="arch" style="align-items:center;gap:4px;">
+  <div class="arch-box layer-user" style="font-size:.9em">📝 你的 JSX 代码<br><small>.jsx 文件，和 React 完全一样</small></div>
+  <div class="arch-arrow">↓</div>
+  <div class="arch-box layer-renderer" style="font-size:.9em">🎨 自定义渲染器<br><small>jsx() → 元素树 → 遍历 → OLED 函数</small></div>
+  <div class="arch-arrow">↓</div>
+  <div class="arch-box layer-ffi" style="font-size:.9em">🔌 FFI 桥接层 (koffi)<br><small>JS 函数 ↔ C 函数映射</small></div>
+  <div class="arch-arrow">↓</div>
+  <div class="arch-box layer-c" style="font-size:.9em">📟 C 驱动库 (oled96)<br><small>SSD1306 初始化 / 写字 / 画点 / I2C 通信</small></div>
+  <div class="arch-arrow">↓</div>
+  <div class="arch-box layer-hw" style="font-size:.9em">🖥️ 物理 OLED 屏幕<br><small>128×64 像素 / I2C 总线 / 地址 0x3C</small></div>
+</div>
+
+<p style="text-align:center;color:var(--accent);margin-top:1em">五层架构，每层只做一件事</p>
+
+<!-- ============================================================ -->
+<h2>三、从底层讲起：C 驱动怎么工作</h2>
+
+<h3>3.1 大一 C 语言就能看懂</h3>
+<p>OLED 屏幕通过 <strong>I2C</strong>（一种双线串行通信协议）连接到树莓派。SSD1306 芯片内部维护 <strong>1024 字节显存</strong>（128列 × 64行 ÷ 8位每字节 = 每字节管 8 个竖排像素）。</p>
+
+<pre><code>// SSD1306 显存结构（1024 字节 = 128 列 × 8 页）
+// 每个字节的 bit0 = 该列最上面像素, bit7 = 最下面
+//
+// Page 0 (y=0~7):  [byte0  byte1  byte2  ... byte127]  ← 屏幕顶部 8 行
+// Page 1 (y=8~15): [byte128 byte129 byte130 ... byte255]
+// ...
+// Page 7 (y=56~63):[byte896 ...              byte1023]  ← 屏幕底部 8 行</code></pre>
+
+<div class="card">
+  <h3 style="margin-top:0">关键 C 函数（我们只用了 5 个）</h3>
+  <table>
+    <tr><th>函数</th><th>作用</th><th style="white-space:nowrap">类比前端</th></tr>
+    <tr>
+      <td><code>oledInit(channel, addr, type, flip, invert)</code></td>
+      <td>打开 I2C 设备文件，发送初始化指令序列给 SSD1306</td>
+      <td><code>new OLED()</code></td>
+    </tr>
+    <tr>
+      <td><code>oledFill(0x00)</code></td>
+      <td>全屏填充 0（清屏/黑屏）</td>
+      <td><code>ctx.clearRect(0,0,128,64)</code></td>
+    </tr>
+    <tr>
+      <td><code>oledWriteString(x, y, "Hello", font)</code></td>
+      <td>在 (x,y) 写字，font=0/1/2 对应 8×8 / 16×24 / 6×8 字体</td>
+      <td><code>ctx.fillText("Hello", x, y)</code></td>
+    </tr>
+    <tr>
+      <td><code>oledSetPixel(x, y, 1)</code></td>
+      <td>点亮/熄灭单个像素</td>
+      <td><code>ctx.fillRect(x,y,1,1)</code></td>
+    </tr>
+    <tr>
+      <td><code>oledShutdown()</code></td>
+      <td>关显示，关 I2C</td>
+      <td><code>cleanup()</code></td>
+    </tr>
+  </table>
+</div>
+
+<div class="tip">
+  <strong>🎯 关键发现：</strong>这些 C 函数是<strong>即写即刷新</strong>的。每个 <code>oledWriteString</code> 调用内部会直接 <code>write(file_i2c, ...)</code> 写到硬件。不需要单独 <code>flush()</code> 步骤。你可以理解为：<strong>每次 draw 调用都自动 commit</strong>。
+</div>
+
+<!-- ============================================================ -->
+<h2>四、JS 怎么调用 C 函数？FFI 桥接</h2>
+
+<p>Node.js 是 JavaScript 运行时，C 是编译型语言。它们之间需要一座桥：<strong>FFI（Foreign Function Interface，外部函数接口）</strong>。</p>
+
+<p>我们用了 <code>koffi</code> 这个 npm 包（纯 JS 实现，不需要编译原生模块）。先把 C 代码编译成共享库：</p>
+
+<pre><code># 把 .c 源文件编译成 .so 动态库
+gcc -shared -fPIC -o liboled96.so oled96.c fonts.c -lm
+
+# 含义：
+# -shared   → 生成共享库（.so），类似 Windows 的 .dll
+# -fPIC     → 位置无关代码（共享库必需的编译选项）
+# -o xxx.so → 输出文件名
+# -lm       → 链接数学库（libm）</code></pre>
+
+<p>然后 JS 这边用 koffi 加载并声明函数签名：</p>
+
+<pre><code>const koffi = require('koffi');
+const lib = koffi.load('./oled_96/liboled96.so');
+
+// 声明 C 函数：函数名、返回值类型、参数类型
+const oledInit        = lib.func('oledInit', 'int', ['int','int','int','int','int']);
+const oledFill        = lib.func('oledFill', 'int', ['uint8']);
+const oledWriteString = lib.func('oledWriteString', 'int', ['int','int','string','int']);
+const oledSetPixel    = lib.func('oledSetPixel', 'int', ['int','int','uint8']);
+const oledShutdown    = lib.func('oledShutdown', 'void', []);
+
+// 调用就像普通 JS 函数！
+oledInit(1, 0x3C, 128, 0, 0);   // I2C总线1, 地址0x3C, 128x64, 不翻转, 不反色
+oledFill(0);                       // 清屏
+oledWriteString(0, 0, 'Hello!', 2); // x=0, y=0, 文字, FONT_SMALL
+oledSetPixel(42, 42, 1);          // 点亮(42,42)
+oledShutdown();                    // 关闭</code></pre>
+
+<div class="warn">
+  <strong>⚠️ 踩坑记录：</strong>最早尝试用 <code>ffi-napi</code>，但在 Node 20 + ARM64 上编译失败（C++ 代码不兼容新版 node-api）。换成 <code>koffi</code>（纯 JS FFI，无需编译）解决了。<br><br>
+  <strong>另一个坑：</strong><code>require('solid-js')</code> 在 Node.js 默认加载 <code>server.cjs</code>（SSR 精简版，响应式系统是假的——<code>createEffect</code> 是空函数！）。必须显式引用 <code>solid-js/dist/solid.cjs</code> 才有完整响应式。
+</div>
+
+<!-- ============================================================ -->
+<h2>五、核心：自定义 JSX 渲染器</h2>
+
+<h3>5.1 思路：和 React Reconciler 一个道理</h3>
+
+<p>React 用 <code>react-reconciler</code> 支持自定义渲染目标（如 React Native → 原生组件）。<br>
+我们的做法更简单：<strong>自定义 JSX pragma</strong>，把 JSX 编译结果拦截下来。</p>
+
+<div class="card">
+  <strong>数据流：</strong>
+  <div class="arch" style="gap:0;margin:1em 0;font-size:.85em">
+    <span style="text-align:center">JSX 源码<br><code>&lt;Text x={0}&gt;Hi&lt;/Text&gt;</code></span>
+    <span style="text-align:center;color:var(--accent)">↓ babel + @babel/plugin-transform-react-jsx</span>
+    <span style="text-align:center">JS 函数调用<br><code>oled.jsx(Text, {x:0}, "Hi")</code></span>
+    <span style="text-align:center;color:var(--accent)">↓ 我们写的 jsx() 函数</span>
+    <span style="text-align:center">元素描述对象<br><code>{type:'text', props:{x:0}, children:["Hi"]}</code></span>
+    <span style="text-align:center;color:var(--accent)">↓ renderElement()</span>
+    <span style="text-align:center">C 函数调用<br><code>oledWriteString(0, 0, "Hi", 2)</code></span>
+    <span style="text-align:center;color:var(--accent)">↓ I2C 总线</span>
+    <span style="text-align:center;font-size:.95em">🖥️ OLED 屏幕显示 "Hi"</span>
+  </div>
+</div>
+
+<h3>5.2 第一步：Babel 编译 JSX</h3>
+
+<p>在 <code>.babelrc</code> 中配置：</p>
+
+<pre><code>{
+  "plugins": [
+    ["@babel/plugin-transform-react-jsx", {
+      "runtime": "classic",
+      "pragma": "oled.jsx",          // &lt;div&gt; → oled.jsx("div", props)
+      "pragmaFrag": "oled.Fragment"  // &lt;&gt; → oled.Fragment
+    }]
+  ]
+}</code></pre>
+
+<p>JSX 编译结果（以 <code>&lt;Text x={0} y={2}&gt;Count: {count()}&lt;/Text&gt;</code> 为例）：</p>
+
+<pre><code>// 编译前（你写的代码）
+&lt;Text x={0} y={2} font={SMALL}&gt;Count: {count()}&lt;/Text&gt;
+
+// 编译后（babel 生成的 JS）
+oled.jsx(Text, { x: 0, y: 2, font: SMALL }, "Count: ", count())</code></pre>
+
+<h3>5.3 第二步：jsx() — 把调用变成元素树</h3>
+
+<pre><code>function jsx(type, props, ...children) {
+  const allProps = props || {};
+  let kids = children.length > 0 ? children : allProps.children;
+
+  // 大写开头 → 组件函数（如 Text, Pixel, Screen）
+  if (typeof type === 'function') {
+    return type({ ...allProps, children: kids });
+  }
+
+  // 小写 → 内置元素（如 'screen', 'text', 'pixel'）
+  return { type, props: allProps, children: normalizeChildren(kids) };
+}</code></pre>
+
+<div class="tip">
+  <strong>React 开发者对比：</strong><br>
+  React: <code>React.createElement('div', props, children)</code> → 虚拟 DOM<br>
+  我们: <code>oled.jsx('text', props, children)</code> → OLED 元素树<br>
+  <strong>思路一模一样，换了渲染目标而已。</strong>
+</div>
+
+<h3>5.4 第三步：renderElement() — 遍历树画到 OLED</h3>
+
+<pre><code>function renderElement(el) {
+  if (typeof el === 'string' || typeof el === 'number') return;
+
+  switch (el.type) {
+    case 'screen':
+      // 根容器，递归渲染子节点
+      for (const child of el.children) renderElement(child);
+      break;
+
+    case 'text': {
+      // 拼接所有子节点的文本，一次性写出
+      let str = '';
+      for (const child of el.children) {
+        if (typeof child === 'string') str += child;
+        else if (typeof child === 'function') str += String(child());
+      }
+      oledWriteString(el.props.x, el.props.y, str, el.props.font ?? 2);
+      break;
+    }
+
+    case 'pixel':
+      oledSetPixel(el.props.x, el.props.y, el.props.on !== false ? 1 : 0);
+      break;
+  }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2>六、响应式：signal 变了 OLED 自动刷新</h2>
+
+<p>这是最关键的部分。SolidJS 的 <code>createSignal</code> 提供响应式状态，但我们需要把"状态变化"和"OLED 刷新"连接起来。</p>
+
+<h3>6.1 关键原则：Signal 创建和 Signal 读取要分离</h3>
+
+<pre><code>// ✅ 正确做法：
+function CounterApp() {
+  // 【创建】signal + 定时器 — 只执行一次
+  const [count, setCount] = createSignal(0);
+  setInterval(() => setCount(c => c + 1), 1000);
+
+  // 【读取】返回一个函数，每次 effect 运行时调用
+  return () => (
+    &lt;Screen&gt;
+      &lt;Text x={0} y={2}&gt;Count: {count()}&lt;/Text&gt;
+    &lt;/Screen&gt;
+  );
+}</code></pre>
+
+<div class="warn">
+  <strong>❌ 错误做法（踩过的坑）：</strong><br>
+  把 JSX 直接放在 return 语句中，导致 <code>counterApp()</code> 在 <code>createRenderEffect</code> 里重复调用。<br>
+  每次重渲染都创建新的 <code>createSignal</code> + <code>setInterval</code>，信号泄漏，屏幕在正确/错误间疯狂跳变，最终乱码。<br>
+  <strong>本质原因：</strong>就像 React 里不能在 render 中 <code>useState</code>，SolidJS 的 <code>createSignal</code> 也只能在组件初始化时调用。
+</div>
+
+<h3>6.2 render() 函数 — 把一切串起来</h3>
+
+<pre><code>function render(code) {
+  oledInit(1, 0x3C, 128, 0, 0);  // 初始化 OLED（一次）
+
+  // ① 先执行 App() — 创建 signal + 定时器 — 只跑一次
+  const getTree = code();  // 返回 () => JSX
+
+  createRoot((dispose) => {
+    // ② createRenderEffect 追踪 signal 变化
+    createRenderEffect(() => {
+      oledFill(0);                  // 清屏
+      const tree = getTree();       // 调用 () => JSX，读取 signal 当前值
+      renderElement(tree);          // 递归渲染到 OLED
+    });
+    // ③ signal 变了 → effect 自动重跑 → 屏幕更新 ✨
+  });
+}</code></pre>
+
+<div class="card" style="text-align:center">
+  <strong style="color:var(--accent)">完整响应式链路：</strong>
+  <div class="arch" style="gap:4px;font-size:.85em;margin-top:.6em">
+    <span>setInterval → setCount(c+1)</span>
+    <span style="color:var(--accent)">↓</span>
+    <span>SolidJS 内部：signal 值更新 + 通知 effect</span>
+    <span style="color:var(--accent)">↓</span>
+    <span>createRenderEffect 重跑：getTree() → 读 count() → 最新 JSX</span>
+    <span style="color:var(--accent)">↓</span>
+    <span>renderElement(tree) → oledFill(0) → oledWriteString(...) → oledSetPixel(...)</span>
+    <span style="color:var(--accent)">↓</span>
+    <span>I2C → OLED 屏幕更新 🎉</span>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2>七、和 Vue/React 的对比</h2>
+
+<table>
+  <tr>
+    <th>概念</th><th>React / Vue (DOM)</th><th>本项目 (OLED)</th>
+  </tr>
+  <tr>
+    <td>渲染目标</td>
+    <td>浏览器 DOM 树</td>
+    <td>SSD1306 显存 (1024字节)</td>
+  </tr>
+  <tr>
+    <td>创建元素</td>
+    <td><code>document.createElement('div')</code></td>
+    <td><code>oled.jsx('text', props)</code> → 元素对象</td>
+  </tr>
+  <tr>
+    <td>更新属性</td>
+    <td><code>el.setAttribute('x', 10)</code></td>
+    <td><code>el.props.x = 10</code> → 重渲染时读到新值</td>
+  </tr>
+  <tr>
+    <td>响应式更新</td>
+    <td>VDOM diff → 最小 DOM 操作</td>
+    <td>全量重渲染 (全屏 1KB 数据，I2C 传输 ~25ms)</td>
+  </tr>
+  <tr>
+    <td>组件</td>
+    <td><code>function Comp() { return &lt;div/&gt; }</code></td>
+    <td><code>function Comp() { return &lt;text/&gt; }</code></td>
+  </tr>
+  <tr>
+    <td>状态管理</td>
+    <td><code>useState</code> / <code>ref</code></td>
+    <td>SolidJS <code>createSignal</code></td>
+  </tr>
+</table>
+
+<p>最大的区别：我们不 diff，而是 <strong>每次 signal 变化全量重绘</strong>。因为 128×64 = 1024 字节，通过 I2C（400kHz）传输只要 ~25ms，肉眼完全看不出闪烁。对于这类小屏幕，"全量重绘"是最简单可靠的方案。</p>
+
+<!-- ============================================================ -->
+<h2>八、项目文件结构</h2>
+
+<pre><code>render-solidjs-to-oled/
+├── .babelrc                # babel 配置：JSX → oled.jsx() 调用
+├── package.json            # npm start / npm run start:clock
+├── oled_96/
+│   ├── oled96.c / oled96.h # C 驱动源码（SSD1306 I2C）
+│   ├── fonts.c              # 像素字体数据（6×8, 8×8, 16×24）
+│   ├── liboled96.so         # 编译产物：C 共享库
+│   └── demo.c               # 原始 C demo（参考用）
+├── src/
+│   ├── run.js               # 入口：注册 babel → 加载 run.jsx
+│   ├── run.jsx              # JSX 入口：render(&lt;App /&gt;)
+│   ├── oled-renderer.js     # 🎯 核心渲染器 (~130行)
+│   │   ├── jsx()            #   JSX pragma → 元素描述对象
+│   │   ├── renderElement()  #   元素树 → OLED C 函数调用
+│   │   └── render()         #   createRoot + createRenderEffect
+│   ├── bindings.js          # FFI：koffi 映射 C 函数
+│   ├── components.jsx       # &lt;Screen&gt; &lt;Text&gt; &lt;Pixel&gt; 组件
+│   └── app.jsx              # 你的 UI（改这里！）
+└── docs.html                # 📖 本文档</code></pre>
+
+<!-- ============================================================ -->
+<h2>九、如何扩展</h2>
+
+<div class="card">
+  <h3 style="margin-top:0">加一个新组件，只需两步</h3>
+
+  <p><strong>1. 在 <code>components.jsx</code> 定义组件：</strong></p>
+  <pre><code>export function Line(props) {
+  return &lt;line x0={props.x0} y0={props.y0} x1={props.x1} y1={props.y1} /&gt;;
+}</code></pre>
+
+  <p><strong>2. 在 <code>oled-renderer.js</code> 的 <code>renderElement</code> 里加渲染逻辑：</strong></p>
+  <pre><code>case 'line':
+  oledDrawLine(el.props.x0, el.props.y0, el.props.x1, el.props.y1, 1);
+  break;</code></pre>
+
+  <p>当然，前提是 C 库里有对应的 <code>oledDrawLine</code> 函数，或者在 C 端加一个。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>十、踩坑汇总</h2>
+
+<table>
+  <tr><th>坑</th><th>现象</th><th>原因</th><th>解决</th></tr>
+  <tr>
+    <td><code>ffi-napi</code> 编译失败</td>
+    <td>Node 20 ARM64 上 C++ 编译报错</td>
+    <td>老 C++ 代码不兼容新版 node-api</td>
+    <td>换用 <code>koffi</code>（纯 JS FFI）</td>
+  </tr>
+  <tr>
+    <td>SolidJS 响应式不工作</td>
+    <td><code>setCount</code> 了但 view 不更新</td>
+    <td><code>require('solid-js')</code> 加载的是 <code>server.cjs</code>（SSR 版，<code>createEffect</code> 是空函数）</td>
+    <td>改用 <code>solid-js/dist/solid.cjs</code></td>
+  </tr>
+  <tr>
+    <td><code>createEffect</code> 初次不执行</td>
+    <td>OLED 初始化后不显示</td>
+    <td><code>createEffect</code> 依赖 <code>requestAnimationFrame</code>，Node.js 没有</td>
+    <td>用 <code>createRenderEffect</code>（同步执行）</td>
+  </tr>
+  <tr>
+    <td>编译后 children 丢失</td>
+    <td>OLED 只显示 <code>() => m()</code></td>
+    <td>babel classic JSX 把 children 作为额外参数而不是 props.children</td>
+    <td><code>jsx(type, props, ...children)</code> 接受 rest 参数</td>
+  </tr>
+  <tr>
+    <td>信号泄漏 + 竞态</td>
+    <td>显示在 "0ount:" / "Count:0" 之间跳跃，最后乱码</td>
+    <td>组件在 <code>createRenderEffect</code> 里重复调用，每次创建新 signal 和 interval</td>
+    <td>组件只执行一次，返回 <code>() => JSX</code> 函数</td>
+  </tr>
+  <tr>
+    <td>babel-preset-solid universal 模式太复杂</td>
+    <td>需要实现 insert/setProp/effect/spread/memo 等全套接口</td>
+    <td>那是为复杂 DOM reconciler 设计的</td>
+    <td>改用简单的 <code>@babel/plugin-transform-react-jsx</code> + 自定义 pragma</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>十一、技术总结</h2>
+
+<div class="card highlight">
+  <p style="font-size:1.1em"><strong>这个项目本质上只做了三件事：</strong></p>
+  <p>
+    <strong>① JSX → 元素树：</strong> 自定义 <code>jsx()</code> 函数，把 babel 编译后的 JSX 调用拦截下来，构造自己的元素描述对象。<br>
+    <strong>② 元素树 → OLED：</strong> <code>renderElement()</code> 递归遍历树，调用 C 驱动函数画到屏幕上。<br>
+    <strong>③ 响应式刷新：</strong> <code>createRenderEffect</code> 追踪 signal，变了就全量重绘。<br>
+  </p>
+  <p style="margin-top:1em">没有 VDOM diff、没有 fiber 调度、没有 DOM 操作 — 因为渲染目标是 1KB 的显存，<strong>最简单的方案就是最好的方案</strong>。</p>
+</div>
+
+</div>
+</body>
+</html>

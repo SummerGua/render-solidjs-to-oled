@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+*.o
+*.so
+output
+
+# IDE / Editor
+.vscode/
+
+# Claude Code local config
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
